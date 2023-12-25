@@ -76,8 +76,19 @@ pub fn read_ase<T: std::io::Read>(mut ase: T) -> Result<(Vec<Group>, Vec<ColorBl
     let mut color_blocks = Vec::new();
     let mut buf_u16 = [0; 2];
 
-    for _ in 0..number_of_blocks {
+    let mut block_read_position = 0;
+
+    let mut safe_skip = false;
+    let mut safe_skip_count = 0_u32;
+
+    while block_read_position < number_of_blocks {
         ase.read_exact(&mut buf_u16)?;
+
+        if buf_u16 == [0; 2] && safe_skip && safe_skip_count < 2 {
+            safe_skip_count += 1;
+            continue;
+        }
+
         let block_type = BlockType::try_from(u16::from_be_bytes(buf_u16))?;
 
         ase.read_exact(&mut buf_u32)?;
@@ -89,23 +100,26 @@ pub fn read_ase<T: std::io::Read>(mut ase: T) -> Result<(Vec<Group>, Vec<ColorBl
         //parse block data and add it appropriate vec
         match block_type {
             BlockType::GroupStart => {
-                let block = Group::parse(&block)?;
-                groups.push(block);
+                let (block, read_blocks) = Group::parse(&mut ase, &block, number_of_blocks)?;
 
-                // read the group end block
-                ase.read_exact(&mut buf_u16)?;
-                if BlockType::try_from(u16::from_be_bytes(buf_u16))? != BlockType::GroupEnd {
-                    // group has no end, file is invalid
-                    return Err(ASEError::Invalid(error::ConformationError::GroupEnd));
-                }
+                safe_skip = true;
+                safe_skip_count = 0;
+
+                block_read_position += read_blocks;
+                groups.push(block);
             }
             //read by the group end
             BlockType::GroupEnd => unreachable!(),
             BlockType::ColorEntry => {
                 let block = ColorBlock::parse(&block)?;
+
+                safe_skip = false;
+                safe_skip_count = 3;
+
                 color_blocks.push(block);
             }
         };
+        block_read_position += 1;
     }
 
     Ok((groups, color_blocks))
@@ -213,7 +227,6 @@ mod tests {
         assert!(res.is_ok());
         let res = res.unwrap();
         assert_eq!(res, (vec![], vec![block]));
-        assert_eq!(res.1.first().unwrap().name, "name".to_owned());
     }
 
     #[test]

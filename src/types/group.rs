@@ -53,13 +53,20 @@ impl Group {
     /// as [`ColorBlock`]s. It stops when either the given bytes are 'empty',parsing a [`ColorBlock`]
     /// fails or the next block is not a [`ColorBlock`].
     ///
+    /// The function returns the [`Group`] containing all found [`ColorBlock`] entries along
+    /// with the total number of additional blocks parsed.
+    ///
     /// # Errors
     /// This function will return an error if either the name cannot be constructed, or
     /// if it cannot be correctly parsed. In either case an [`ASEError::Invalid`] is returned.
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ASEError> {
-        let name_length = u16::from_be_bytes(bytes[0..2].try_into()?);
+    pub(crate) fn parse<T: std::io::Read>(
+        mut ase: T,
+        block: &[u8],
+        blocks_to_read: u32,
+    ) -> Result<(Self, u32), ASEError> {
+        let name_length = u16::from_be_bytes(block[0..2].try_into()?);
         //read name bytes, but stop before not byte
-        let name_bytes: Vec<u16> = bytes[2..(name_length as usize * 2)]
+        let name_bytes: Vec<u16> = block[2..(name_length as usize * 2)]
             .chunks_exact(2)
             .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
             .collect();
@@ -67,13 +74,15 @@ impl Group {
 
         let mut pointer = name_length as usize * 2 + 2;
         let mut blocks = Vec::new();
+
+        // Read all the blocks included in this GroupStart block
         loop {
-            if pointer >= bytes.len() - 1 {
+            if pointer >= block.len() - 1 {
                 break;
             }
 
             let block_type = BlockType::try_from(u16::from_be_bytes(
-                bytes[pointer..(pointer + 2)].try_into()?,
+                block[pointer..(pointer + 2)].try_into()?,
             ))?;
 
             if block_type != BlockType::ColorEntry {
@@ -82,17 +91,64 @@ impl Group {
             pointer += 2;
 
             let block_length =
-                u32::from_be_bytes(bytes[pointer..(pointer + 4)].try_into()?) as usize;
+                u32::from_be_bytes(block[pointer..(pointer + 4)].try_into()?) as usize;
             pointer += 4;
 
-            let Ok(block) = ColorBlock::parse(&bytes[pointer..]) else {
+            let Ok(block) = ColorBlock::parse(&block[pointer..]) else {
                 break;
             };
             pointer += block_length;
             blocks.push(block);
         }
 
-        Ok(Self::new(name, blocks))
+        let mut buf_u16 = [0; 2];
+        let mut buf_u32 = [0; 4];
+
+        let mut found_more_colors = false;
+        let mut additional_blocks_read = 0;
+
+        let mut remaining_blocks_to_read = blocks_to_read;
+
+        // Loop until we find a group-end block
+        let broke_on_end = loop {
+            if remaining_blocks_to_read == 0 {
+                break true;
+            }
+
+            ase.read_exact(&mut buf_u16)?;
+            let block_type = BlockType::try_from(u16::from_be_bytes(buf_u16))?;
+
+            if block_type == BlockType::GroupEnd {
+                additional_blocks_read += 1;
+                break true;
+            } else if block_type != BlockType::ColorEntry
+                || (additional_blocks_read == 0 && !blocks.is_empty())
+            {
+                break false;
+            }
+
+            ase.read_exact(&mut buf_u32)?;
+            let block_length = u32::from_be_bytes(buf_u32);
+
+            found_more_colors = true;
+
+            let mut block = vec![0; block_length as usize];
+            ase.read_exact(&mut block)?;
+            let block = ColorBlock::parse(&block)?;
+            blocks.push(block);
+            additional_blocks_read += 1;
+            remaining_blocks_to_read -= 1;
+        };
+
+        if !broke_on_end && !found_more_colors {
+            return Err(ASEError::Invalid(crate::ConformationError::GroupEnd));
+        }
+
+        if broke_on_end && !found_more_colors && additional_blocks_read > 0 {
+            additional_blocks_read -= 1;
+        }
+
+        Ok((Self::new(name, blocks), additional_blocks_read))
     }
 }
 
@@ -171,16 +227,23 @@ mod tests {
                 ),
             ],
         );
+
         assert_eq!(
             group,
-            Group::parse(&[
-                0, 11, 0, 103, 0, 114, 0, 111, 0, 117, 0, 112, 0, 32, 0, 110, 0, 97, 0, 109, 0,
-                101, 0, 0, 0, 1, 0, 0, 0, 34, 0, 11, 0, 108, 0, 105, 0, 103, 0, 104, 0, 116, 0, 32,
-                0, 103, 0, 114, 0, 101, 0, 121, 0, 0, 71, 114, 97, 121, 63, 0, 0, 0, 0, 2, 0, 1, 0,
-                0, 0, 38, 0, 9, 0, 100, 0, 97, 0, 114, 0, 107, 0, 32, 0, 114, 0, 101, 0, 100, 0, 0,
-                82, 71, 66, 32, 63, 0, 0, 0, 62, 153, 153, 154, 61, 204, 204, 205, 0, 2, 192, 2
-            ])
+            Group::parse(
+                &*vec![0; 0],
+                &*vec![
+                    0, 11, 0, 103, 0, 114, 0, 111, 0, 117, 0, 112, 0, 32, 0, 110, 0, 97, 0, 109, 0,
+                    101, 0, 0, 0, 1, 0, 0, 0, 34, 0, 11, 0, 108, 0, 105, 0, 103, 0, 104, 0, 116, 0,
+                    32, 0, 103, 0, 114, 0, 101, 0, 121, 0, 0, 71, 114, 97, 121, 63, 0, 0, 0, 0, 2,
+                    0, 1, 0, 0, 0, 38, 0, 9, 0, 100, 0, 97, 0, 114, 0, 107, 0, 32, 0, 114, 0, 101,
+                    0, 100, 0, 0, 82, 71, 66, 32, 63, 0, 0, 0, 62, 153, 153, 154, 61, 204, 204,
+                    205, 0, 2, 192, 2
+                ],
+                0
+            )
             .unwrap()
+            .0
         );
     }
 
@@ -203,14 +266,19 @@ mod tests {
         );
         assert_eq!(
             group,
-            Group::parse(&[
-                0, 1, 0, 0, 0, 1, 0, 0, 0, 34, 0, 11, 0, 108, 0, 105, 0, 103, 0, 104, 0, 116, 0,
-                32, 0, 103, 0, 114, 0, 101, 0, 121, 0, 0, 71, 114, 97, 121, 63, 0, 0, 0, 0, 2, 0,
-                1, 0, 0, 0, 38, 0, 9, 0, 100, 0, 97, 0, 114, 0, 107, 0, 32, 0, 114, 0, 101, 0, 100,
-                0, 0, 82, 71, 66, 32, 63, 0, 0, 0, 62, 153, 153, 154, 61, 204, 204, 205, 0, 2, 192,
-                2
-            ])
+            Group::parse(
+                &*vec![0; 0],
+                &vec![
+                    0, 1, 0, 0, 0, 1, 0, 0, 0, 34, 0, 11, 0, 108, 0, 105, 0, 103, 0, 104, 0, 116,
+                    0, 32, 0, 103, 0, 114, 0, 101, 0, 121, 0, 0, 71, 114, 97, 121, 63, 0, 0, 0, 0,
+                    2, 0, 1, 0, 0, 0, 38, 0, 9, 0, 100, 0, 97, 0, 114, 0, 107, 0, 32, 0, 114, 0,
+                    101, 0, 100, 0, 0, 82, 71, 66, 32, 63, 0, 0, 0, 62, 153, 153, 154, 61, 204,
+                    204, 205, 0, 2, 192, 2
+                ],
+                0
+            )
             .unwrap()
+            .0
         );
     }
 }
